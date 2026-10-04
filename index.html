@@ -75,7 +75,7 @@ main{max-width:720px;margin:0 auto;padding:16px 16px calc(130px + env(safe-area-
 .empty .big{font-size:48px;margin-bottom:8px}
 .note{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin:12px 0;font-size:15px}
 .note.warn{background:var(--warn-bg);border-color:transparent;color:var(--warn)}
-.note.err{background:color-mix(in srgb,var(--rec) 12%,transparent);border-color:transparent;color:var(--rec)}
+.note.err{white-space:pre-line;background:color-mix(in srgb,var(--rec) 12%,transparent);border-color:transparent;color:var(--rec)}
 .muted{color:var(--muted)}
 .small-t{font-size:14px}
 input[type=text],input[type=password],input:not([type]){width:100%;font-size:16px;padding:12px 14px;border-radius:12px;
@@ -319,13 +319,39 @@ function apiMsg(status, body) {
   let msg = '';
   try { const j = typeof body === 'string' ? JSON.parse(body) : body; msg = j?.error?.message || ''; } catch { msg = String(body || '').slice(0, 200); }
   if (/API_KEY_INVALID|API key not valid/i.test(msg)) return 'La chiave API non è valida. Controllala nelle Impostazioni.';
-  if (status === 429) return 'Limite di utilizzo gratuito raggiunto. Riprova tra qualche minuto (o domani se è il limite giornaliero).';
+  if (status === 429) {
+    const hint = /limit: 0\b/.test(msg)
+      ? 'Il modello scelto non ha quota gratuita con questa chiave: in Impostazioni tocca "Salva e verifica" e scegli un altro modello "flash".'
+      : /per ?day|PerDay/i.test(msg) ? 'È il limite giornaliero: riprova domani.' : 'Riprova tra qualche minuto.';
+    return `Google ha rifiutato la richiesta per limiti di utilizzo. ${hint}\nDettagli di Google: ${msg.slice(0, 400)}`;
+  }
   if (status === 403) return 'Chiave API non autorizzata (' + msg + ').';
   if (status === 404) return 'Modello non trovato: controlla il nome del modello nelle Impostazioni. (' + msg + ')';
   if (status >= 500) return 'Il servizio Google è momentaneamente sovraccarico. Riprova tra poco.';
   return `Errore ${status}: ${msg || 'richiesta non riuscita'}`;
 }
-async function apiError(r) { const e = new Error(apiMsg(r.status, await r.text())); e.status = r.status; return e; }
+function makeApiError(status, body) {
+  const e = new Error(apiMsg(status, body)); e.status = status;
+  try { // RetryInfo tells how long to wait for per-minute limits
+    const d = JSON.parse(body)?.error?.details?.find(x => /RetryInfo/.test(x['@type']));
+    if (d?.retryDelay) e.retryAfter = parseFloat(d.retryDelay);
+    e.dailyOrZero = /limit: 0\b|per ?day|PerDay/i.test(body);
+  } catch {}
+  return e;
+}
+async function apiError(r) { return makeApiError(r.status, await r.text()); }
+// Waits and retries when Google says "too many requests this minute" or is briefly overloaded
+async function withRetry(fn, onWait) {
+  for (let i = 0; ; i++) {
+    try { return await fn(); }
+    catch (e) {
+      const wait = e.status === 429 && !e.dailyOrZero ? Math.min(Math.max(e.retryAfter || 60, 10), 120)
+        : e.status >= 500 ? 15 : 0;
+      if (!wait || i >= 3) throw e;
+      for (let s = Math.ceil(wait); s > 0; s--) { onWait?.(s); await sleep(1000); }
+    }
+  }
+}
 const keyHeaders = () => ({'x-goog-api-key': S.key});
 
 function xhrPost(url, blob, headers, onProg) {
@@ -336,7 +362,7 @@ function xhrPost(url, blob, headers, onProg) {
     x.upload.onprogress = e => { if (e.lengthComputable) onProg(Math.round(e.loaded / e.total * 100)); };
     x.onload = () => {
       if (x.status >= 200 && x.status < 300) { try { res(JSON.parse(x.responseText)); } catch (e) { rej(e); } }
-      else { const e = new Error(apiMsg(x.status, x.responseText)); e.status = x.status; rej(e); }
+      else rej(makeApiError(x.status, x.responseText));
     };
     x.onerror = () => rej(new Error('Errore di rete durante il caricamento dell\'audio. Controlla la connessione.'));
     x.send(blob);
@@ -430,11 +456,13 @@ async function transcribe(blob, L, prog) {
     prog({stage: 'upload', pct: 0});
     const up = await uploadAudio(blob, mime, L.title || 'lezione', pct => prog({stage: 'upload', pct}));
     try {
-      prog({stage: 'transcribe', words: 0});
-      return await streamGenerate(S.mTr, {
-        contents: [{role: 'user', parts: [up.part, {text: TR_PROMPT}]}],
-        generationConfig: {maxOutputTokens: 65536},
-      }, t => prog({stage: 'transcribe', words: words(t), preview: t.slice(-400)}));
+      return await withRetry(() => {
+        prog({stage: 'transcribe', words: 0, preview: '', wait: 0});
+        return streamGenerate(S.mTr, {
+          contents: [{role: 'user', parts: [up.part, {text: TR_PROMPT}]}],
+          generationConfig: {maxOutputTokens: 65536},
+        }, t => prog({stage: 'transcribe', words: words(t), preview: t.slice(-400)}));
+      }, s => prog({stage: 'transcribe', wait: s}));
     } catch (e) {
       if (attempt === 0 && e.status === 400 && MIME_FALLBACK[mime] && /mime|format|support/i.test(e.message)) { mime = MIME_FALLBACK[mime]; continue; }
       throw e;
@@ -442,12 +470,15 @@ async function transcribe(blob, L, prog) {
   }
 }
 function summarize(L, prog) {
-  return streamGenerate(S.mSum, {
-    systemInstruction: {parts: [{text: SUM_SYS}]},
-    contents: [{role: 'user', parts: [{text: `Titolo assegnato alla lezione: ${L.title}\n\nTRASCRIZIONE DELLA LEZIONE:\n\n${L.transcript}`}]}],
-    tools: [{googleSearch: {}}],
-    generationConfig: {maxOutputTokens: 32768},
-  }, t => prog({stage: 'summary', words: words(t), preview: t.slice(-400)}));
+  return withRetry(() => {
+    prog({stage: 'summary', words: 0, preview: '', wait: 0});
+    return streamGenerate(S.mSum, {
+      systemInstruction: {parts: [{text: SUM_SYS}]},
+      contents: [{role: 'user', parts: [{text: `Titolo assegnato alla lezione: ${L.title}\n\nTRASCRIZIONE DELLA LEZIONE:\n\n${L.transcript}`}]}],
+      tools: [{googleSearch: {}}],
+      generationConfig: {maxOutputTokens: 32768},
+    }, t => prog({stage: 'summary', words: words(t), preview: t.slice(-400)}));
+  }, s => prog({stage: 'summary', wait: s}));
 }
 
 /* ================= processing jobs ================= */
@@ -461,6 +492,7 @@ async function processLecture(id, {retranscribe = false} = {}) {
   if (!S.key) { toast('Prima inserisci la chiave API di Gemini'); go('#/settings'); return; }
   setJob(id, {stage: 'start'});
   const wl = await wakeLock();
+  let phase = 'Trascrizione';
   try {
     let L = await DB.get('lectures', id);
     if (retranscribe || !L.transcript) {
@@ -469,13 +501,13 @@ async function processLecture(id, {retranscribe = false} = {}) {
       const tr = await transcribe(a.blob, L, p => setJob(id, p));
       L = await patchLecture(id, {transcript: tr.text, truncated: tr.finish === 'MAX_TOKENS', summary: null, sources: null, status: 'trascritta', error: null});
     }
-    setJob(id, {stage: 'summary', words: 0, preview: ''});
+    phase = 'Riassunto';
     const sm = await summarize(L, p => setJob(id, p));
     await patchLecture(id, {summary: sm.text, sources: sm.sources, queries: sm.queries, status: 'pronta', error: null, summarizedAt: Date.now()});
     toast('Riassunto pronto ✓');
   } catch (e) {
     console.error(e);
-    await patchLecture(id, {error: e.message || String(e)});
+    await patchLecture(id, {error: `${phase} non riuscito. ${e.message || e}`});
   } finally {
     delete JOBS[id];
     try { await wl?.release(); } catch {}
@@ -735,7 +767,8 @@ async function renderProc(L) {
   const box = $('#proc'); if (!box) return;
   const id = cur.id, j = JOBS[id];
   if (j) {
-    const label = j.stage === 'upload' ? `Caricamento audio… ${j.pct || 0}%`
+    const label = j.wait ? `Google chiede di aspettare (limite al minuto): riprovo tra ${j.wait} s…`
+      : j.stage === 'upload' ? `Caricamento audio… ${j.pct || 0}%`
       : j.stage === 'transcribe' ? `Trascrizione in corso… ${j.words ? j.words.toLocaleString('it-IT') + ' parole' : 'ascolto la registrazione'}`
       : j.stage === 'summary' ? `Riassunto e ricerca di fonti scientifiche… ${j.words ? j.words.toLocaleString('it-IT') + ' parole' : ''}`
       : 'Avvio…';

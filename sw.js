@@ -1,5 +1,5 @@
 // App shell cache: network first (so updates arrive), cache as offline fallback.
-const CACHE = 'lezioni-v1';
+const CACHE = 'lezioni-v2';
 const ASSETS = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './apple-touch-icon.png'];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)));
